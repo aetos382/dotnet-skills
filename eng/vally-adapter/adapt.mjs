@@ -240,17 +240,19 @@ function evalIdentity(evalFile) {
 // skill is *expected to stay dormant* isn't flagged on the dashboard as a
 // missing activation. This is a deliberately small, block-scalar-aware YAML
 // scan rather than a full parser so the adapter keeps its zero-dependency
-// contract (no `yaml` module is guaranteed on CI runners). If the file can't be
-// read, the set is empty and every scenario defaults to expect-activation —
-// matching the historical behavior.
+// contract (no `yaml` module is guaranteed on CI runners). Reading the spec is
+// required because silently defaulting to expect-activation can remove an
+// explicit dormancy contract from the pass gate.
 function readNonActivationStimuli(evalFile, repoRoot) {
   const path = resolve(repoRoot ?? ".", evalFile);
-  if (!existsSync(path)) return new Set();
   let text;
   try {
     text = readFileSync(path, "utf-8");
-  } catch {
-    return new Set();
+  } catch (error) {
+    const detail = error instanceof Error ? error.message : String(error);
+    const readError = new Error(`cannot read eval spec ${evalFile} at ${path}: ${detail}`);
+    readError.code = "eval_spec_unreadable";
+    throw readError;
   }
   const lines = text.split(/\r?\n/);
   const indentOf = (l) => l.length - l.trimStart().length;
@@ -417,6 +419,86 @@ function mean(nums) {
   return xs.length ? xs.reduce((a, b) => a + b, 0) / xs.length : null;
 }
 
+function continuedAfterSkillActivation(record) {
+  const events = record.trajectory?.events;
+  if (!Array.isArray(events) || events.length === 0) return null;
+
+  let activated = false;
+  for (const event of events) {
+    if (event?.type === "skill_activation" || event?.type === "skill.invoked") {
+      activated = true;
+      continue;
+    }
+    if (
+      activated
+      && (event?.type === "tool_call" || event?.type === "tool.execution_start")
+    ) {
+      const toolName = event?.data?.toolName ?? event?.data?.name;
+      if (toolName && toolName !== "skill") return true;
+    }
+  }
+
+  return activated ? false : null;
+}
+
+function postActivationFromRecords(records) {
+  const summary = {
+    activatedRuns: 0,
+    continuedRuns: 0,
+    activationOnlyCompletions: 0,
+    failedActivationOnlyCompletions: 0,
+    unclassifiedRuns: 0,
+  };
+
+  for (const record of records ?? []) {
+    const metrics = record.trajectory?.metrics;
+    const activationCount = metrics?.skillActivationCount ?? 0;
+    if (activationCount <= 0) continue;
+
+    summary.activatedRuns += 1;
+    const orderedContinuation = continuedAfterSkillActivation(record);
+    if (orderedContinuation === true) {
+      summary.continuedRuns += 1;
+      continue;
+    }
+    if (
+      orderedContinuation === false
+      && record.trajectory?.endReason === "completed"
+    ) {
+      summary.activationOnlyCompletions += 1;
+      if (record.gradeResult?.passed === false) {
+        summary.failedActivationOnlyCompletions += 1;
+      }
+      continue;
+    }
+
+    const toolCallCount = metrics?.toolCallCount;
+    const skillToolCallCount =
+      metrics?.toolCallBreakdown?.skill ?? activationCount;
+    if (!Number.isFinite(toolCallCount) || !Number.isFinite(skillToolCallCount)) {
+      summary.unclassifiedRuns += 1;
+      continue;
+    }
+
+    if (
+      orderedContinuation === null
+      && toolCallCount === skillToolCallCount
+      && toolCallCount > 0
+      && record.trajectory?.endReason === "completed"
+    ) {
+      summary.activationOnlyCompletions += 1;
+      if (record.gradeResult?.passed === false) {
+        summary.failedActivationOnlyCompletions += 1;
+      }
+      continue;
+    }
+
+    summary.unclassifiedRuns += 1;
+  }
+
+  return summary.activatedRuns > 0 ? summary : null;
+}
+
 /**
  * Collapse one variant's records for a single stimulus into the absolute-role
  * shape the dashboard consumes: quality (0-5 overallScore), efficiency metrics
@@ -452,7 +534,13 @@ function roleFromRecords(records) {
   const activated = records.some((r) => (r.trajectory?.metrics?.skillActivationCount ?? 0) > 0);
   const timedOut = records.some((r) => r.trajectory?.endReason === "agent_timeout");
 
-  return { overallScore, activated, timedOut, metrics };
+  return {
+    overallScore,
+    activated,
+    timedOut,
+    metrics,
+    postActivation: postActivationFromRecords(records),
+  };
 }
 
 // Dashboard role object: { judgeResult: { overallScore }, metrics }.
@@ -920,7 +1008,7 @@ function pct(x) {
   return `${(x * 100).toFixed(1)}%`;
 }
 
-function comparisonToVerdict(report, identity, roles, nonActivationStims) {
+function comparisonToVerdict(report, identity, roles, nonActivationStims, targetKind = "skill") {
   const s = report.summary;
   const unmatchedBaseline = report.unmatchedBaseline ?? [];
   const unmatchedTreatment = report.unmatchedTreatment ?? [];
@@ -1078,12 +1166,24 @@ function comparisonToVerdict(report, identity, roles, nonActivationStims) {
         ? "activation_contract_only"
         : null,
       timedOut: Boolean(skilled?.timedOut),
-      skillActivationIsolated: { activated: Boolean(skilled?.activated) },
+      skillActivationIsolated: {
+        activated: Boolean(skilled?.activated),
+        ...(skilled?.postActivation ?? {}),
+      },
       baseline: roleToDashboard(baseline),
       skilledIsolated: roleToDashboard(skilled),
     };
+    if (targetKind === "agent") {
+      scenario.agentActivationIsolated = { activated: Boolean(skilled?.activated) };
+    }
     if (hasPlugin) {
-      scenario.skillActivationPlugin = { activated: Boolean(plugin?.activated) };
+      scenario.skillActivationPlugin = {
+        activated: Boolean(plugin?.activated),
+        ...(plugin?.postActivation ?? {}),
+      };
+      if (targetKind === "agent") {
+        scenario.agentActivationPlugin = { activated: Boolean(plugin?.activated) };
+      }
       scenario.skilledPlugin = roleToDashboard(plugin);
     }
     return scenario;
@@ -1154,8 +1254,14 @@ function comparisonToVerdict(report, identity, roles, nonActivationStims) {
     .map((scenario) => ({
       scenarioName: scenario.scenarioName,
       expected: "dormant",
-      observed: scenario.skillActivationIsolated?.activated ? "activated" : "dormant",
-      satisfied: !scenario.skillActivationIsolated?.activated,
+      observed: (targetKind === "agent"
+        ? scenario.agentActivationIsolated?.activated
+        : scenario.skillActivationIsolated?.activated)
+        ? "activated"
+        : "dormant",
+      satisfied: !(targetKind === "agent"
+        ? scenario.agentActivationIsolated?.activated
+        : scenario.skillActivationIsolated?.activated),
     }));
   const activationContractFailures = activationContractScenarios.filter(
     (scenario) => !scenario.satisfied,
@@ -1173,7 +1279,7 @@ function comparisonToVerdict(report, identity, roles, nonActivationStims) {
   const activationContract = {
     evaluated: true,
     requiredForPass: true,
-    source: "isolated_target_skill_activation",
+    source: `isolated_target_${targetKind}_activation`,
     reason:
       "Explicit dormancy expectations are evaluated independently of preference",
     count: activationContractScenarios.length,
@@ -1224,7 +1330,7 @@ function comparisonToVerdict(report, identity, roles, nonActivationStims) {
                       `${discordant} discordant preference vote(s). The sign test conditions on non-tie ` +
                       `stimulus votes and cannot reach ${SIGN_TEST_ALPHA} below ${MIN_CREDIBLE_STIMULI}, so ` +
                       `no record could have passed here — this is not a measured null. Either the ` +
-                      `skill is inert on these scenarios (make them discriminate) or the eval ` +
+                      `${targetKind} is inert on these scenarios (make them discriminate) or the eval ` +
                       `needs more distinct stimuli to clear the ties`
                     : `not credible (sign test p=${pValue.toFixed(3)} > ${SIGN_TEST_ALPHA})`;
 
@@ -1305,6 +1411,7 @@ function comparisonToVerdict(report, identity, roles, nonActivationStims) {
   return {
     skillName: identity.skill,
     skillPath: identity.skillPath,
+    skillKind: targetKind,
     state,
     stateReason,
     conclusive,
@@ -1406,7 +1513,7 @@ function verdictSummaryLine(v) {
   return `${icon} ${v.skillName}: ${v.reason}${scenarios ? "\n" + scenarios : ""}`;
 }
 
-function invalidVerdict(identity, cause, message, accounting = {}) {
+function invalidVerdict(identity, cause, message, accounting = {}, targetKind = "skill") {
   const error = {
     phase: cause.phase,
     kind: cause.kind ?? "permanent",
@@ -1416,6 +1523,7 @@ function invalidVerdict(identity, cause, message, accounting = {}) {
   return {
     skillName: identity.skill,
     skillPath: identity.skillPath,
+    skillKind: targetKind,
     state: VERDICT_STATES.INVALID_INCONCLUSIVE,
     stateReason: { code: cause.code, phase: cause.phase },
     conclusive: false,
@@ -1523,7 +1631,7 @@ function invalidVerdict(identity, cause, message, accounting = {}) {
 
 function writeVerdictResults(outputRoot, evalFile, identity, verdict, expectedEval) {
   const results = {
-    schemaVersion: 4,
+    schemaVersion: 5,
     evalFile,
     model: opts.model,
     judgeModel: opts["judge-model"],
@@ -1654,6 +1762,31 @@ function main() {
         continue;
       }
 
+      let nonActivationStimuli;
+      try {
+        nonActivationStimuli = readNonActivationStimuli(evalFile, opts["repo-root"]);
+      } catch (error) {
+        const detail = error instanceof Error ? error.message : String(error);
+        const message = `${plugin}/${skill}: ${detail}`;
+        warn(message);
+        const verdict = invalidVerdict(
+          identity,
+          { code: "eval_spec_unreadable", phase: "adapter", kind: "permanent" },
+          message,
+          {
+            baselineRecords: baseline.length,
+            skilledRecords: skilled.length,
+            pluginRecords: pluginRecs.length,
+          },
+        );
+        const outputPath = writeVerdictResults(outputRoot, evalFile, identity, verdict, expectedEval);
+        console.log(`\n${verdictSummaryLine(verdict)}\n  → ${outputPath}`);
+        recordInvalidEval(evalFile, verdict);
+        written++;
+        incomplete++;
+        continue;
+      }
+
       const baselineSlice = join(workDir, `${plugin}__${skill}__baseline.jsonl`);
       const skilledSlice = join(workDir, `${plugin}__${skill}__skilled.jsonl`);
       const compareOut = join(workDir, `${plugin}__${skill}__compare.jsonl`);
@@ -1718,7 +1851,7 @@ function main() {
           report,
           identity,
           roles,
-          readNonActivationStimuli(evalFile, opts["repo-root"]),
+          nonActivationStimuli,
         );
       } catch (error) {
         const detail = error instanceof Error ? error.message : String(error);
@@ -1815,6 +1948,8 @@ if (isMain) {
 export {
   roleFromRecords,
   roleToDashboard,
+  continuedAfterSkillActivation,
+  postActivationFromRecords,
   groupByStimulus,
   stimulusOf,
   comparisonToVerdict,

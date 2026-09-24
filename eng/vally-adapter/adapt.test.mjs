@@ -9,7 +9,9 @@ import test from "node:test";
 import {
   comparisonToVerdict,
   classifyComparisonError,
+  continuedAfterSkillActivation,
   mergeComparisonReports,
+  postActivationFromRecords,
   readNonActivationStimuli,
   splitVallyCommand,
   signTestPValue,
@@ -163,27 +165,26 @@ function runAdapter(
   trialCount = 5,
   expectedEvalFiles = [evalFile],
   experimentFactory = createExperiment,
+  repoRoot,
 ) {
   const runDir = experimentFactory(root);
   const outputRoot = join(root, "output");
   const expectedEvalsPath = join(root, "expected-evals.txt");
   writeFileSync(expectedEvalsPath, `${expectedEvalFiles.join("\n")}\n`);
   const fakeVally = createFakeVally(root, mode, trialCount);
-  const result = spawnSync(
-    process.execPath,
-    [
-      adapterPath,
-      "--experiment-dir",
-      runDir,
-      "--output-root",
-      outputRoot,
-      "--vally",
-      fakeVally.command,
-      "--expected-evals",
-      expectedEvalsPath,
-    ],
-    { encoding: "utf8" },
-  );
+  const args = [
+    adapterPath,
+    "--experiment-dir",
+    runDir,
+    "--output-root",
+    outputRoot,
+    "--vally",
+    fakeVally.command,
+    "--expected-evals",
+    expectedEvalsPath,
+  ];
+  if (repoRoot) args.push("--repo-root", repoRoot);
+  const result = spawnSync(process.execPath, args, { encoding: "utf8" });
   const verdictPath = join(
     outputRoot,
     "dotnet-diag",
@@ -225,6 +226,7 @@ test("retries a transient comparison error once", () => {
     assert.equal(verdict.underpowered, false);
     assert.equal(verdict.passed, true);
     assert.equal(verdict.state, VERDICT_STATES.VALID_PASS);
+    assert.equal(verdict.skillKind, "skill");
     assert.equal(verdict.recoveredErrors.length, 5);
     assert.match(processOutput(result), /without replacing successful judgments/);
   });
@@ -310,6 +312,31 @@ test("a malformed comparison report becomes one explicit invalid result", () => 
     const summary = JSON.parse(readFileSync(join(outputRoot, "adapter-summary.json"), "utf8"));
     assert.equal(summary.writtenResultCount, 1);
     assert.deepEqual(summary.invalidEvals, [evalFile]);
+    assert.deepEqual(summary.measurementInvalidEvals, [evalFile]);
+  });
+});
+
+test("an unreadable eval spec becomes one measurement-invalid result", () => {
+  withTempDir((root) => {
+    const { result, compareCount, verdict, outputRoot } = runAdapter(
+      root,
+      "clean",
+      5,
+      [evalFile],
+      createExperiment,
+      root,
+    );
+
+    assert.equal(result.status, 0, result.stderr);
+    assert.equal(compareCount, undefined);
+    assert.equal(verdict.state, VERDICT_STATES.INVALID_INCONCLUSIVE);
+    assert.equal(verdict.stateReason.code, "eval_spec_unreadable");
+    assert.equal(verdict.errors[0].phase, "adapter");
+    assert.match(verdict.errors[0].message, /cannot read eval spec/);
+
+    const summary = JSON.parse(readFileSync(join(outputRoot, "adapter-summary.json"), "utf8"));
+    assert.equal(summary.invalidEvalCount, 1);
+    assert.equal(summary.measurementInvalidEvalCount, 1);
     assert.deepEqual(summary.measurementInvalidEvals, [evalFile]);
   });
 });
@@ -542,6 +569,161 @@ const reportFromRepeatedScores = (scores, summaryOverrides = {}) =>
 
 const gate = (scores, summaryOverrides) =>
   comparisonToVerdict(reportFromScores(scores, summaryOverrides), IDENTITY, EMPTY_ROLES, new Set());
+
+test("ordered events require a non-skill tool call after activation", () => {
+  assert.equal(
+    continuedAfterSkillActivation({
+      trajectory: {
+        events: [
+          { type: "tool_call", data: { toolName: "view" } },
+          { type: "tool_call", data: { toolName: "skill" } },
+          { type: "skill_activation", data: { name: "example" } },
+        ],
+      },
+    }),
+    false,
+  );
+  assert.equal(
+    continuedAfterSkillActivation({
+      trajectory: {
+        events: [
+          { type: "tool_call", data: { toolName: "skill" } },
+          { type: "skill_activation", data: { name: "example" } },
+          { type: "tool_call", data: { toolName: "view" } },
+        ],
+      },
+    }),
+    true,
+  );
+});
+
+test("post-activation telemetry distinguishes continuation from activation-only completion", () => {
+  const summary = postActivationFromRecords([
+    {
+      gradeResult: { passed: false },
+      trajectory: {
+        endReason: "completed",
+        metrics: {
+          skillActivationCount: 1,
+          toolCallCount: 1,
+          toolCallBreakdown: { skill: 1 },
+        },
+      },
+    },
+    {
+      gradeResult: { passed: true },
+      trajectory: {
+        endReason: "completed",
+        events: [
+          { type: "tool_call", data: { toolName: "skill" } },
+          { type: "skill_activation", data: { name: "example" } },
+          { type: "tool_call", data: { toolName: "view" } },
+        ],
+        metrics: {
+          skillActivationCount: 1,
+          toolCallCount: 3,
+          toolCallBreakdown: { skill: 1, view: 1, bash: 1 },
+        },
+      },
+    },
+    {
+      gradeResult: { passed: false },
+      trajectory: {
+        endReason: "completed",
+        events: [
+          { type: "tool_call", data: { toolName: "view" } },
+          { type: "tool_call", data: { toolName: "skill" } },
+          { type: "skill_activation", data: { name: "example" } },
+        ],
+        metrics: {
+          skillActivationCount: 1,
+          toolCallCount: 2,
+          toolCallBreakdown: { skill: 1, view: 1 },
+        },
+      },
+    },
+    {
+      gradeResult: { passed: true },
+      trajectory: {
+        endReason: "completed",
+        metrics: {
+          skillActivationCount: 1,
+          toolCallCount: 1,
+          toolCallBreakdown: { skill: 1 },
+        },
+      },
+    },
+    {
+      gradeResult: { passed: false },
+      trajectory: {
+        endReason: "agent_timeout",
+        metrics: {
+          skillActivationCount: 1,
+          toolCallCount: 1,
+          toolCallBreakdown: { skill: 1 },
+        },
+      },
+    },
+    {
+      gradeResult: { passed: true },
+      trajectory: {
+        endReason: "completed",
+        metrics: {
+          skillActivationCount: 0,
+          toolCallCount: 0,
+        },
+      },
+    },
+  ]);
+
+  assert.deepEqual(summary, {
+    activatedRuns: 5,
+    continuedRuns: 1,
+    activationOnlyCompletions: 3,
+    failedActivationOnlyCompletions: 2,
+    unclassifiedRuns: 1,
+  });
+});
+
+test("scenario results retain post-activation telemetry for isolated and plugin runs", () => {
+  const records = [
+    {
+      gradeResult: { passed: false, score: 0 },
+      trajectory: {
+        endReason: "completed",
+        metrics: {
+          skillActivationCount: 1,
+          toolCallCount: 1,
+          toolCallBreakdown: { skill: 1 },
+        },
+      },
+    },
+  ];
+  const verdict = comparisonToVerdict(
+    reportFromScores([0]),
+    IDENTITY,
+    {
+      baselineByStim: new Map(),
+      skilledByStim: new Map([["Scenario 1", records]]),
+      pluginByStim: new Map([["Scenario 1", records]]),
+      hasPlugin: true,
+    },
+    new Set(),
+  );
+
+  assert.deepEqual(verdict.scenarios[0].skillActivationIsolated, {
+    activated: true,
+    activatedRuns: 1,
+    continuedRuns: 0,
+    activationOnlyCompletions: 1,
+    failedActivationOnlyCompletions: 1,
+    unclassifiedRuns: 0,
+  });
+  assert.deepEqual(
+    verdict.scenarios[0].skillActivationPlugin,
+    verdict.scenarios[0].skillActivationIsolated,
+  );
+});
 
 test("dormancy parser matches PyYAML Boolean false spellings exactly", () => {
   const root = mkdtempSync(join(tmpdir(), "vally-dormancy-yaml-"));
